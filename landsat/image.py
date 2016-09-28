@@ -66,13 +66,14 @@ class BaseProcess(VerbosityMixin):
 
     """
 
-    def __init__(self, path, bands=None, dst_path=None, verbose=False, force_unzip=False, bounds=None):
+    def __init__(self, path, bands=None, color_correction=True, dst_path=None, verbose=False, force_unzip=False, bounds=None):
 
         self.projection = {'init': 'epsg:3857'}
         self.dst_crs = {'init': u'epsg:3857'}
         self.scene = get_file(path).split('.')[0]
         self.bands = bands if isinstance(bands, list) else [4, 3, 2]
         self.clipped = False
+        self.color_correction = color_correction
 
         # Landsat source path
         self.src_path = os.path.split(path)[0]
@@ -449,12 +450,9 @@ class PanSharpen(BaseProcess):
         bands = self._read_bands()
         image_data = self._get_image_data()
 
-        new_bands = self._generate_new_bands(image_data['shape'])
+        bands[:3] = self._resize(bands[:3], image_data['shape'])
 
-        bands[:3] = self._rescale(bands[:3])
-        new_bands.append(numpy.empty(image_data['shape'], dtype=numpy.uint16))
-
-        self._warp(image_data, bands, new_bands)
+        new_bands = bands
 
         # Bands are no longer needed
         del bands
@@ -469,22 +467,25 @@ class PanSharpen(BaseProcess):
             'width': image_data['shape'][1],
             'height': image_data['shape'][0],
             'count': 3,
-            'dtype': numpy.uint16,
             'nodata': 0,
             'transform': image_data['dst_transform'],
             'photometric': 'RGB',
             'crs': self.dst_crs
         }
 
+        if self.color_correction:
+            rasterio_options['dtype'] = numpy.uint8
+        else:
+            rasterio_options['dtype'] = numpy.uint16
+
         return self._write_to_file(new_bands, pan, **rasterio_options)
 
     @rasterio_decorator
     def _write_to_file(self, new_bands, pan, **kwargs):
-
-        # Read coverage from QBA
-        coverage = self._calculate_cloud_ice_perc()
-
         self.output("Final Steps", normal=True, arrow=True)
+
+        if self.color_correction:
+            coverage = self._calculate_cloud_ice_perc()
 
         suffix = 'bands_%s_pan' % "".join(map(str, self.bands))
 
@@ -493,11 +494,15 @@ class PanSharpen(BaseProcess):
         output = rasterio.open(output_file, 'w', **kwargs)
 
         for i, band in enumerate(new_bands):
-            # Color Correction
             band = numpy.multiply(band, pan)
-            band = band.astype(numpy.uint16)
-            band = rescale_intensity(band, in_range=(band.min(), band.max()), out_range=(0, 65535))
-            output.write_band(i + 1, band)
+
+            if self.color_correction:
+                band = self._color_correction(band, self.bands[i], 0, coverage)
+                output.write_band(i + 1, img_as_ubyte(band))
+            else:
+                band = band.astype(numpy.uint16)
+                band = rescale_intensity(band, in_range=(band.min(), band.max()), out_range=(0, 65535))
+                output.write_band(i + 1, band)
 
             new_bands[i] = None
 
@@ -514,6 +519,16 @@ class PanSharpen(BaseProcess):
         pan = numpy.multiply(numpy.nan_to_num(numpy.true_divide(1, m)), bands[self.band8])
 
         return pan
+
+    def _resize(self, bands, shape):
+        """ Resize bands """
+
+        for key, band in enumerate(bands):
+            self.output("Resizing %s" % self.bands[key], normal=True, color='green', indent=1)
+            bands[key] = sktransform.resize(band, shape)
+            bands[key] = (bands[key] * 65535).astype('uint16')
+
+        return bands
 
     def _rescale(self, bands):
         """ Rescale bands """
